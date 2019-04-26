@@ -30,6 +30,39 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	entry.Port = port
 	entry.Text = text
 
+	return RegisterServiceEntry(entry, ifaces)
+}
+
+// RegisterProxy registers a service proxy. This call will skip the hostname/IP lookup and
+// will use the provided values.
+func RegisterProxy(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface) (*Server, error) {
+	if host == "" {
+		return nil, fmt.Errorf("Missing host name")
+	}
+
+	entry := NewServiceEntry(instance, service, domain)
+	entry.Port = port
+	entry.Text = text
+	entry.HostName = host
+
+	for _, ip := range ips {
+		ipAddr := net.ParseIP(ip)
+		if ipAddr == nil {
+			return nil, fmt.Errorf("Failed to parse given IP: %v", ip)
+		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
+			entry.AddrIPv4 = append(entry.AddrIPv4, ipAddr)
+		} else if ipv6 := ipAddr.To16(); ipv6 != nil {
+			entry.AddrIPv6 = append(entry.AddrIPv6, ipAddr)
+		} else {
+			return nil, fmt.Errorf("The IP is neither IPv4 nor IPv6: %#v", ipAddr)
+		}
+	}
+
+	return RegisterServiceEntry(entry, ifaces)
+}
+
+// RegisterServiceEntry a service entry.
+func RegisterServiceEntry(entry *ServiceEntry, ifaces []net.Interface) (*Server, error) {
 	if entry.Instance == "" {
 		return nil, fmt.Errorf("Missing service instance name")
 	}
@@ -41,6 +74,10 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	}
 	if entry.Port == 0 {
 		return nil, fmt.Errorf("Missing port")
+	}
+
+	if entry.TTL == 0 {
+		entry.TTL = 3200
 	}
 
 	var err error
@@ -59,10 +96,12 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 		ifaces = listMulticastInterfaces()
 	}
 
-	for _, iface := range ifaces {
-		v4, v6 := addrsForInterface(&iface)
-		entry.AddrIPv4 = append(entry.AddrIPv4, v4...)
-		entry.AddrIPv6 = append(entry.AddrIPv6, v6...)
+	if len(entry.AddrIPv4) == 0 && len(entry.AddrIPv6) == 0 {
+		for _, iface := range ifaces {
+			v4, v6 := addrsForInterface(&iface)
+			entry.AddrIPv4 = append(entry.AddrIPv4, v4...)
+			entry.AddrIPv6 = append(entry.AddrIPv6, v6...)
+		}
 	}
 
 	if entry.AddrIPv4 == nil && entry.AddrIPv6 == nil {
@@ -75,63 +114,7 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	}
 
 	s.service = entry
-	go s.mainloop()
-	go s.probe()
 
-	return s, nil
-}
-
-// RegisterProxy registers a service proxy. This call will skip the hostname/IP lookup and
-// will use the provided values.
-func RegisterProxy(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface) (*Server, error) {
-	entry := NewServiceEntry(instance, service, domain)
-	entry.Port = port
-	entry.Text = text
-	entry.HostName = host
-
-	if entry.Instance == "" {
-		return nil, fmt.Errorf("Missing service instance name")
-	}
-	if entry.Service == "" {
-		return nil, fmt.Errorf("Missing service name")
-	}
-	if entry.HostName == "" {
-		return nil, fmt.Errorf("Missing host name")
-	}
-	if entry.Domain == "" {
-		entry.Domain = "local"
-	}
-	if entry.Port == 0 {
-		return nil, fmt.Errorf("Missing port")
-	}
-
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
-		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
-	}
-
-	for _, ip := range ips {
-		ipAddr := net.ParseIP(ip)
-		if ipAddr == nil {
-			return nil, fmt.Errorf("Failed to parse given IP: %v", ip)
-		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
-			entry.AddrIPv4 = append(entry.AddrIPv4, ipAddr)
-		} else if ipv6 := ipAddr.To16(); ipv6 != nil {
-			entry.AddrIPv6 = append(entry.AddrIPv6, ipAddr)
-		} else {
-			return nil, fmt.Errorf("The IP is neither IPv4 nor IPv6: %#v", ipAddr)
-		}
-	}
-
-	if len(ifaces) == 0 {
-		ifaces = listMulticastInterfaces()
-	}
-
-	s, err := newServer(ifaces)
-	if err != nil {
-		return nil, err
-	}
-
-	s.service = entry
 	go s.mainloop()
 	go s.probe()
 
@@ -153,7 +136,6 @@ type Server struct {
 	shutdownLock   sync.Mutex
 	shutdownEnd    sync.WaitGroup
 	isShutdown     bool
-	ttl            uint32
 }
 
 // Constructs server structure
@@ -175,7 +157,6 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		ipv4conn:       ipv4conn,
 		ipv6conn:       ipv6conn,
 		ifaces:         ifaces,
-		ttl:            3200,
 		shouldShutdown: make(chan struct{}),
 	}
 
@@ -201,11 +182,6 @@ func (s *Server) Shutdown() {
 func (s *Server) SetText(text []string) {
 	s.service.Text = text
 	s.announceText()
-}
-
-// TTL sets the TTL for DNS replies
-func (s *Server) TTL(ttl uint32) {
-	s.ttl = ttl
 }
 
 // Shutdown server will close currently open connections & channel
@@ -380,7 +356,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 
 	switch q.Name {
 	case s.service.ServiceTypeName():
-		s.serviceTypeName(resp, s.ttl)
+		s.serviceTypeName(resp)
 		if isKnownAnswer(resp, query) {
 			resp.Answer = nil
 		}
@@ -392,7 +368,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		}
 
 	case s.service.ServiceInstanceName():
-		s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
+		s.composeLookupAnswers(resp, ifIndex, s.service.CacheFlush)
 	}
 
 	return nil
@@ -404,7 +380,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 			Name:   s.service.ServiceName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
+			Ttl:    s.service.TTL,
 		},
 		Ptr: s.service.ServiceInstanceName(),
 	}
@@ -415,7 +391,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
+			Ttl:    s.service.TTL,
 		},
 		Txt: s.service.Text,
 	}
@@ -424,7 +400,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
+			Ttl:    s.service.TTL,
 		},
 		Priority: 0,
 		Weight:   0,
@@ -433,10 +409,10 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 	}
 	resp.Extra = append(resp.Extra, srv, txt)
 
-	resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
+	resp.Extra = s.appendAddrs(resp.Extra, ifIndex, s.service.CacheFlush)
 }
 
-func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
+func (s *Server) composeLookupAnswers(resp *dns.Msg, ifIndex int, flushCache bool) {
 	// From RFC6762
 	//    The most significant bit of the rrclass for a record in the Answer
 	//    Section of a response message is the Multicast DNS cache-flush bit
@@ -447,7 +423,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			Name:   s.service.ServiceName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
-			Ttl:    ttl,
+			Ttl:    s.service.TTL,
 		},
 		Ptr: s.service.ServiceInstanceName(),
 	}
@@ -456,7 +432,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    ttl,
+			Ttl:    s.service.TTL,
 		},
 		Priority: 0,
 		Weight:   0,
@@ -468,7 +444,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    ttl,
+			Ttl:    s.service.TTL,
 		},
 		Txt: s.service.Text,
 	}
@@ -477,16 +453,16 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			Name:   s.service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
-			Ttl:    ttl,
+			Ttl:    s.service.TTL,
 		},
 		Ptr: s.service.ServiceName(),
 	}
 	resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
 
-	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+	resp.Answer = s.appendAddrs(resp.Answer, ifIndex, flushCache)
 }
 
-func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
+func (s *Server) serviceTypeName(resp *dns.Msg) {
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -500,7 +476,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 			Name:   s.service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
-			Ttl:    ttl,
+			Ttl:    s.service.TTL,
 		},
 		Ptr: s.service.ServiceName(),
 	}
@@ -519,7 +495,7 @@ func (s *Server) probe() {
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
+			Ttl:    s.service.TTL,
 		},
 		Priority: 0,
 		Weight:   0,
@@ -531,7 +507,7 @@ func (s *Server) probe() {
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
+			Ttl:    s.service.TTL,
 		},
 		Txt: s.service.Text,
 	}
@@ -561,7 +537,7 @@ func (s *Server) probe() {
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			s.composeLookupAnswers(resp, s.ttl, intf.Index, true)
+			s.composeLookupAnswers(resp, intf.Index, true)
 			if err := s.multicastResponse(resp, intf.Index); err != nil {
 				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
 			}
@@ -581,7 +557,7 @@ func (s *Server) announceText() {
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    s.ttl,
+			Ttl:    s.service.TTL,
 		},
 		Txt: s.service.Text,
 	}
@@ -595,11 +571,11 @@ func (s *Server) unregister() error {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, 0, true)
+	s.composeLookupAnswers(resp, 0, true)
 	return s.multicastResponse(resp, 0)
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
+func (s *Server) appendAddrs(list []dns.RR, ifIndex int, flushCache bool) []dns.RR {
 	v4 := s.service.AddrIPv4
 	v6 := s.service.AddrIPv6
 	if len(v4) == 0 && len(v6) == 0 {
@@ -610,6 +586,7 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
+	ttl := s.service.TTL
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
 		// use TTL of 120s, to account for network interface
