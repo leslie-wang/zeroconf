@@ -367,6 +367,8 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 			resp.Answer = nil
 		}
 
+	case s.service.HostName:
+		fallthrough
 	case s.service.ServiceInstanceName():
 		s.composeLookupAnswers(resp, ifIndex, s.service.CacheFlush)
 	}

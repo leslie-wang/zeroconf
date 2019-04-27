@@ -73,6 +73,9 @@ func TestBasic(t *testing.T) {
 }
 
 func TestNoRegister(t *testing.T) {
+	// wait 5 second until last cache is expired
+	time.Sleep(5 * time.Second)
+
 	resolver, err := NewResolver(nil)
 	if err != nil {
 		t.Fatalf("Expected create resolver success, but got %v", err)
