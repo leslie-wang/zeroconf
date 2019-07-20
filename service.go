@@ -88,6 +88,25 @@ func (l *LookupParams) disableProbing() {
 	l.once.Do(func() { close(l.stopProbing) })
 }
 
+// CallbackHook defines the different hook points for callback event
+type CallbackHook int
+
+const (
+	// NetworkV4 hook is triggered after receiving network packet
+	NetworkV4 CallbackHook = iota
+	// NetworkV6 hook is triggered after receiving network packet
+	NetworkV6
+	// Unpack hook is triggered after unpack packet
+	Unpack
+	// ResponseUnicast is triggered after sending unicast reply
+	ResponseUnicast
+	// ResponseMulticast is triggered after sending multicast reply
+	ResponseMulticast
+)
+
+// Callback for event callback purpose
+type Callback func(CallbackHook, error, []interface{})
+
 // ServiceEntry represents a browse/lookup result for client API.
 // It is also used to configure service registration (server API), which is
 // used to answer multicast queries.
@@ -100,11 +119,18 @@ type ServiceEntry struct {
 	AddrIPv4   []net.IP `json:"-"`        // Host machine IPv4 address
 	AddrIPv6   []net.IP `json:"-"`        // Host machine IPv6 address
 	CacheFlush bool     `json:"-"`        // Cache flush of the service record
+	Callback   Callback `json:"-"`        // Callback function to allow caller to intercept internal event
 }
 
 // NewServiceEntry constructs a ServiceEntry.
 func NewServiceEntry(instance, service, domain string) *ServiceEntry {
 	return &ServiceEntry{
 		ServiceRecord: *NewServiceRecord(instance, service, domain),
+	}
+}
+
+func (se *ServiceEntry) callback(h CallbackHook, e error, args ...interface{}) {
+	if se.Callback != nil {
+		se.Callback(h, e, args)
 	}
 }
