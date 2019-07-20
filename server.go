@@ -229,6 +229,7 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
+				s.service.callback(NetworkV4, err)
 				continue
 			}
 			if cm != nil {
@@ -257,6 +258,7 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
+				s.service.callback(NetworkV6, err)
 				continue
 			}
 			if cm != nil {
@@ -274,8 +276,10 @@ func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
 		// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
+		s.service.callback(Unpack, err, packet, ifIndex, from)
 		return err
 	}
+	s.service.callback(Unpack, nil, msg, ifIndex, from)
 	return s.handleQuery(&msg, ifIndex, from)
 }
 
@@ -308,14 +312,18 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 
 		if isUnicastQuestion(q) {
 			// Send unicast
-			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
+			e := s.unicastResponse(&resp, ifIndex, from)
+			if e != nil {
 				err = e
 			}
+			s.service.callback(ResponseUnicast, e, q, resp, ifIndex, from)
 		} else {
 			// Send mulicast
-			if e := s.multicastResponse(&resp, ifIndex); e != nil {
+			e := s.multicastResponse(&resp, ifIndex)
+			if e != nil {
 				err = e
 			}
+			s.service.callback(ResponseUnicast, e, q, resp, ifIndex, from)
 		}
 	}
 
